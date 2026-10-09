@@ -1,18 +1,21 @@
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { AuthProvider } from './src/context/AuthContext';
 import RootNavigator from './src/navigation/RootNavigator';
-import type { VendorAppState } from './src/navigation/types';
-
-// Temporary: flip this by hand to preview any flow. Real switching comes from
-// stored auth + the Vendor row's status (PENDING / APPROVED) once the API is
-// wired up. The type lives in src/navigation/types.ts so RootNavigator can
-// share it without importing from App.tsx.
-const vendorAppState: VendorAppState = 'loggedOut';
+import { ThemeProvider } from './src/theme/ThemeContext';
 
 export default function App() {
   return (
     <SafeAreaProvider>
-      <RootNavigator state={vendorAppState} />
+      {/* Theme is outermost: the auth screens, the loading gate and the
+          profile-fetch error state all need colours before there is a user.
+          Which flow renders is computed inside RootNavigator from auth plus
+          GET /v1/vendors/me — there is no hand-flipped state constant. */}
+      <ThemeProvider>
+        <AuthProvider>
+          <RootNavigator />
+        </AuthProvider>
+      </ThemeProvider>
     </SafeAreaProvider>
   );
 }

@@ -1,13 +1,32 @@
-// Shared typed API client — used by Customer, Vendor, and Rider apps
-// so all three hit the same typed endpoints and never drift apart.
+/**
+ * @easzygoo/api-client — the shared typed API layer for the Customer, Vendor
+ * and Rider apps.
+ *
+ * Pure TypeScript: no React Native, no Firebase. Each app supplies its own
+ * `getToken` when creating the client.
+ *
+ *   const api = createApiClient({
+ *     baseUrl: process.env.EXPO_PUBLIC_API_URL!,
+ *     getToken: () => auth().currentUser?.getIdToken() ?? Promise.resolve(null),
+ *   });
+ *   const cats = await listCategories(api);
+ */
 
-const BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:4000';
+export { createApiClient, ApiError } from './client';
+export type { ApiClient, ApiClientOptions, RequestOptions } from './client';
 
-export async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`);
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
-}
+export * from './types';
 
-// Add typed request/response types and POST/PUT/DELETE helpers here
-// as Phase 1 endpoints (auth, catalog) come online.
+export * from './endpoints/addresses';
+export * from './endpoints/admin';
+export * from './endpoints/auth';
+export * from './endpoints/catalog';
+export * from './endpoints/discovery';
+export * from './endpoints/onboarding';
+export * from './endpoints/orders';
+export * from './endpoints/notifications';
+export * from './endpoints/riders';
+export * from './endpoints/search';
+export * from './endpoints/uploads';
+export * from './endpoints/users';
+export * from './endpoints/vendors';

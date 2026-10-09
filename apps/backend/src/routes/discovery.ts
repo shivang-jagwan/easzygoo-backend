@@ -1,95 +1,52 @@
 import type { FastifyInstance } from 'fastify';
+
 import { prisma } from '../lib/prisma';
-
-const EARTH_RADIUS_KM = 6371;
-const KM_PER_DEG_LAT = 111.045; // good enough for a bounding box
-const DEFAULT_MAX_RADIUS_KM = 10;
-
-/** Great-circle distance in km between two lat/lng points. */
-function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return EARTH_RADIUS_KM * 2 * Math.asin(Math.sqrt(a));
-}
-
-interface NearbyQuery {
-  lat?: string;
-  lng?: string;
-  maxRadiusKm?: string;
-}
+import { RATE_LIMITS, perIp } from '../lib/rate-limits';
+import { findNearbyVendors, parseGeoParams, type GeoQuery } from '../lib/geo';
 
 export default async function discoveryRoutes(app: FastifyInstance) {
-  // GET /v1/vendors/nearby — public
-  //
-  // NOTE: bounding-box prefilter + in-memory Haversine is fine at low vendor
-  // counts. If the vendor table grows large this should move to a PostGIS
-  // `ST_DWithin` query or a geospatial index rather than scanning the box.
-  app.get<{ Querystring: NearbyQuery }>('/vendors/nearby', async (request, reply) => {
-    const lat = Number(request.query.lat);
-    const lng = Number(request.query.lng);
-    if (
-      request.query.lat === undefined ||
-      request.query.lng === undefined ||
-      !Number.isFinite(lat) ||
-      !Number.isFinite(lng) ||
-      lat < -90 ||
-      lat > 90 ||
-      lng < -180 ||
-      lng > 180
-    ) {
-      return reply
-        .code(400)
-        .send({ error: 'lat and lng are required and must be valid coordinates' });
-    }
-
-    let maxRadiusKm = DEFAULT_MAX_RADIUS_KM;
-    if (request.query.maxRadiusKm !== undefined) {
-      maxRadiusKm = Number(request.query.maxRadiusKm);
-      if (!Number.isFinite(maxRadiusKm) || maxRadiusKm <= 0) {
-        return reply.code(400).send({ error: 'maxRadiusKm must be a positive number' });
+  // GET /v1/vendors/nearby — public. Geo logic lives in lib/geo so this and
+  // /v1/search stay on one implementation.
+  app.get<{ Querystring: GeoQuery }>(
+    '/vendors/nearby',
+    { config: perIp(RATE_LIMITS.discovery) },
+    async (request, reply) => {
+      const geo = parseGeoParams(request.query);
+      if (!geo.ok) {
+        return reply.code(400).send({ error: geo.error });
       }
-    }
 
-    // Rough bounding box around (lat, lng) sized to maxRadiusKm so we don't scan
-    // every vendor row. Longitude degrees shrink with latitude; clamp cos near the poles.
-    const latDelta = maxRadiusKm / KM_PER_DEG_LAT;
-    const lngDelta =
-      maxRadiusKm / (KM_PER_DEG_LAT * Math.max(Math.cos((lat * Math.PI) / 180), 0.01));
+      return findNearbyVendors(geo.lat, geo.lng, geo.maxRadiusKm);
+    },
+  );
 
-    const candidates = await prisma.vendor.findMany({
-      where: {
-        status: 'APPROVED',
-        isOpen: true,
-        latitude: { gte: lat - latDelta, lte: lat + latDelta },
-        longitude: { gte: lng - lngDelta, lte: lng + lngDelta },
-      },
+  /**
+   * GET /v1/vendors/:vendorId — public storefront detail.
+   *
+   * Only APPROVED stores exist publicly: anything else is a 404, so a pending
+   * or suspended store is indistinguishable from a missing one. Only
+   * customer-facing fields are selected — no owner, bank or status data.
+   * (`:vendorId`, not `:id`, to match /vendors/:vendorId/products.)
+   */
+  app.get<{ Params: { vendorId: string } }>('/vendors/:vendorId', async (request, reply) => {
+    const vendor = await prisma.vendor.findFirst({
+      where: { id: request.params.vendorId, status: 'APPROVED' },
       select: {
         id: true,
         storeName: true,
-        latitude: true,
-        longitude: true,
+        address: true,
+        isOpen: true,
+        openTime: true,
+        closeTime: true,
         deliveryRadiusKm: true,
       },
     });
+    if (!vendor) {
+      return reply.code(404).send({ error: 'Vendor not found' });
+    }
 
-    const results = candidates
-      .map((v) => ({
-        id: v.id,
-        storeName: v.storeName,
-        latitude: v.latitude,
-        longitude: v.longitude,
-        deliveryRadiusKm: v.deliveryRadiusKm,
-        distanceKm: haversineKm(lat, lng, v.latitude, v.longitude),
-      }))
-      // must be inside both the vendor's own delivery radius and the search cap
-      .filter((v) => v.distanceKm <= Math.min(v.deliveryRadiusKm, maxRadiusKm))
-      .sort((a, b) => a.distanceKm - b.distanceKm)
-      .map((v) => ({ ...v, distanceKm: Math.round(v.distanceKm * 100) / 100 }));
-
-    return results;
+    // Ratings are not built yet; the field is in the contract so clients can
+    // render "no rating" now and need no change when it lands.
+    return { ...vendor, averageRating: null };
   });
 }

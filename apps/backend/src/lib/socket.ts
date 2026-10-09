@@ -1,10 +1,13 @@
 import type { Server as HttpServer } from 'node:http';
 import { Server, type Socket } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
-import Redis from 'ioredis';
 import type { Role } from '@prisma/client';
 import { verifyFirebaseToken } from './auth-middleware';
+import { allowedOrigins, trustProxy } from './env';
+import { isAllowedOrigin } from './origins';
 import { prisma } from './prisma';
+import { REDIS_PREFIX, createRedis } from './redis';
+import { forgetRider, recordRiderLocation } from './rider-location';
 
 /*
  * Real-time order tracking
@@ -23,16 +26,23 @@ import { prisma } from './prisma';
  *   order:status     { orderId, status, updatedAt }   emitted by order-lifecycle routes
  *   rider:location   { lat, lng, updatedAt }          rebroadcast to the order room
  *   error            { event, message }               join/emit refused
+ *   auth:expired     { }                              token expired; server disconnects
+ *
+ * Token expiry: a Firebase ID token lives ~1 hour, and the handshake is the
+ * only time it is checked. When it expires the server emits `auth:expired` and
+ * disconnects, so a stale session cannot stay connected indefinitely. The
+ * client should fetch a fresh token and reconnect.
  */
 
 export interface SocketUser {
   userId: string;
   role: Role;
+  /** Token expiry, seconds since the epoch. */
+  tokenExp: number;
 }
 
-/** At most one Rider location write per this many ms, per rider. */
-const LOCATION_WRITE_THROTTLE_MS = 5000;
-const lastLocationWrite = new Map<string, number>();
+/** setTimeout's ceiling; a longer delay would fire immediately. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 let io: Server | undefined;
 
@@ -46,6 +56,19 @@ export function emitOrderStatus(orderId: string, status: string): void {
   io?.to(`order:${orderId}`).emit('order:status', {
     orderId,
     status,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Rebroadcast a rider's position to everyone watching that order. Never
+ * throttled — the throttle in lib/rider-location.ts applies to the DB write only.
+ * Shared by the socket handler and PATCH /v1/riders/me/location.
+ */
+export function emitRiderLocation(orderId: string, lat: number, lng: number): void {
+  io?.to(`order:${orderId}`).emit('rider:location', {
+    lat,
+    lng,
     updatedAt: new Date().toISOString(),
   });
 }
@@ -94,22 +117,24 @@ async function resolveAssignedRider(user: SocketUser, orderId: string): Promise<
 
 export function initSocket(httpServer: HttpServer): Server {
   io = new Server(httpServer, {
-    // Open for now so the three mobile apps can connect from any origin.
-    // TODO: restrict to the deployed app origins before launch.
-    cors: { origin: '*' },
+    // CORS headers only for allow-listed browser origins…
+    cors: { origin: allowedOrigins },
+    // …and the real gate: same origin rule as the HTTP API (lib/origins.ts).
+    // Native clients (no Origin, or their own same-origin Origin) pass.
+    allowRequest: (req, callback) => {
+      const forwardedHost = trustProxy ? req.headers['x-forwarded-host'] : undefined;
+      const host = (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) ?? req.headers.host;
+      callback(null, isAllowedOrigin(req.headers.origin, host));
+    },
   });
 
   // Redis adapter so emits reach clients connected to any backend instance
-  // (the PM2 cluster / multiple Render instances).
-  const redisUrl = process.env.REDIS_URL;
-  if (redisUrl) {
-    const pubClient = new Redis(redisUrl);
-    const subClient = pubClient.duplicate();
-    // ioredis throws on an unhandled 'error' event, which would take the whole
-    // process down on a transient Redis blip. Log and let ioredis reconnect.
-    pubClient.on('error', (err) => console.error('[socket] redis pub error:', err.message));
-    subClient.on('error', (err) => console.error('[socket] redis sub error:', err.message));
-    io.adapter(createAdapter(pubClient, subClient));
+  // (the PM2 cluster / multiple Render instances). Channels live under the
+  // `sock` prefix (lib/redis.ts). createRedis logs errors instead of throwing.
+  const pubClient = createRedis('socket-pub');
+  const subClient = createRedis('socket-sub');
+  if (pubClient && subClient) {
+    io.adapter(createAdapter(pubClient, subClient, { key: REDIS_PREFIX.socket }));
   } else {
     console.warn('[socket] REDIS_URL not set — running without the Redis adapter (single instance only)');
   }
@@ -125,7 +150,11 @@ export function initSocket(httpServer: HttpServer): Server {
       if (!user) {
         return next(new Error('No account for this token'));
       }
-      socket.data.user = { userId: user.id, role: user.role } satisfies SocketUser;
+      socket.data.user = {
+        userId: user.id,
+        role: user.role,
+        tokenExp: decoded.exp,
+      } satisfies SocketUser;
       next();
     } catch (err) {
       next(new Error(err instanceof Error ? err.message : 'Unauthorized'));
@@ -134,6 +163,13 @@ export function initSocket(httpServer: HttpServer): Server {
 
   io.on('connection', (socket: Socket) => {
     const user = socket.data.user as SocketUser;
+
+    // Disconnect when the handshake token expires (see header comment).
+    const expiresInMs = Math.min(user.tokenExp * 1000 - Date.now(), MAX_TIMER_MS);
+    const expiryTimer = setTimeout(() => {
+      socket.emit('auth:expired', {});
+      socket.disconnect(true);
+    }, Math.max(expiresInMs, 0));
 
     socket.on('order:join', async (orderId: unknown) => {
       if (typeof orderId !== 'string' || !orderId) {
@@ -150,6 +186,15 @@ export function initSocket(httpServer: HttpServer): Server {
 
     // orderId -> promise of the rider's own Rider.id for that order (null if not theirs).
     const orderAuth = new Map<string, Promise<string | null>>();
+    // This socket's own Rider.id once any authorisation has resolved it.
+    let ownRiderId: string | null = null;
+
+    // Nothing per-connection may outlive the connection.
+    socket.on('disconnect', () => {
+      clearTimeout(expiryTimer);
+      orderAuth.clear();
+      if (ownRiderId) forgetRider(ownRiderId);
+    });
 
     socket.on('rider:location', async (payload: unknown) => {
       const p = (payload ?? {}) as Record<string, unknown>;
@@ -176,6 +221,7 @@ export function initSocket(httpServer: HttpServer): Server {
         orderAuth.set(orderId, assigned);
       }
       const riderId = await assigned;
+      if (riderId) ownRiderId = riderId;
       if (!riderId) {
         socket.emit('error', { event: 'rider:location', message: 'Not the assigned rider for this order' });
         return;
@@ -184,24 +230,26 @@ export function initSocket(httpServer: HttpServer): Server {
       // Broadcast FIRST. Nothing below this line may delay or reorder it —
       // otherwise a message that happens to hit the DB write falls behind the
       // messages after it that skipped the write.
-      io?.to(`order:${orderId}`).emit('rider:location', {
-        lat,
-        lng,
-        updatedAt: new Date().toISOString(),
-      });
+      emitRiderLocation(orderId, lat, lng);
 
-      // Then persist, throttled to once per 5s per rider, fire-and-forget so it
-      // never blocks this handler or the next message.
-      const now = Date.now();
-      const last = lastLocationWrite.get(riderId) ?? 0;
-      if (now - last >= LOCATION_WRITE_THROTTLE_MS) {
-        lastLocationWrite.set(riderId, now);
-        void prisma.rider
-          .update({ where: { id: riderId }, data: { currentLat: lat, currentLng: lng } })
-          .catch((err) => console.error('[socket] rider location write failed:', err.message));
-      }
+      // Then persist, throttled per rider, fire-and-forget so it never blocks
+      // this handler or the next message.
+      recordRiderLocation(riderId, lat, lng);
     });
   });
 
   return io;
+}
+
+/**
+ * Disconnect every client and stop the Socket.io engine. Used by graceful
+ * shutdown; the HTTP server itself is closed by Fastify. The adapter's Redis
+ * clients are quit with the rest by quitAllRedis().
+ */
+export async function closeSocket(): Promise<void> {
+  if (!io) return;
+  const server = io;
+  io = undefined;
+  server.disconnectSockets(true);
+  await server.close();
 }

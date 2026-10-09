@@ -44,6 +44,9 @@ enum ProductUnit {
 }
 
 enum OrderStatus {
+  // ONLINE orders will wait here until Razorpay confirms payment; vendors and
+  // riders never see an order in this state. Unused until ONLINE is enabled.
+  PENDING_PAYMENT
   PLACED
   ACCEPTED
   PREPARING
@@ -51,6 +54,16 @@ enum OrderStatus {
   OUT_FOR_DELIVERY
   DELIVERED
   CANCELLED
+}
+
+enum PaymentMethod {
+  COD
+  ONLINE
+}
+
+enum DiscountType {
+  FLAT
+  PERCENT
 }
 
 enum PaymentStatus {
@@ -79,12 +92,13 @@ model User {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  addresses    Address[]
-  vendor       Vendor?
-  rider        Rider?
-  orders       Order[]  @relation("CustomerOrders")
-  ratingsGiven Rating[] @relation("RatingsGiven")
-  pushTokens   PushToken[]
+  addresses         Address[]
+  vendor            Vendor?
+  rider             Rider?
+  orders            Order[]            @relation("CustomerOrders")
+  ratingsGiven      Rating[]           @relation("RatingsGiven")
+  pushTokens        PushToken[]
+  couponRedemptions CouponRedemption[]
 
   @@index([role])
 }
@@ -126,23 +140,23 @@ model PushToken {
 // ---------- Phase 1: Vendor & Rider profiles ----------
 
 model Vendor {
-  id                     String       @id @default(cuid())
-  userId                 String       @unique
-  storeName              String
-  latitude               Float
-  longitude              Float
-  address                String
-  pincode                String
-  deliveryRadiusKm       Float        @default(3)
-  openTime               String? // "09:00"
-  closeTime              String? // "21:00"
-  isOpen                 Boolean      @default(true)
-  status                 VendorStatus @default(PENDING)
-  bankAccountNumber      String?
-  bankIfsc               String?
-  cashfreeBeneficiaryId  String?
-  createdAt              DateTime     @default(now())
-  updatedAt              DateTime     @updatedAt
+  id                    String       @id @default(cuid())
+  userId                String       @unique
+  storeName             String
+  latitude              Float
+  longitude             Float
+  address               String
+  pincode               String
+  deliveryRadiusKm      Float        @default(3)
+  openTime              String? // "09:00"
+  closeTime             String? // "21:00"
+  isOpen                Boolean      @default(true)
+  status                VendorStatus @default(PENDING)
+  bankAccountNumber     String?
+  bankIfsc              String?
+  cashfreeBeneficiaryId String?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 
   user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   products Product[]
@@ -151,6 +165,8 @@ model Vendor {
 
   @@index([pincode])
   @@index([status])
+  // Nearby-store bounding-box scan (lib/geo.ts findNearbyVendors).
+  @@index([status, isOpen, latitude, longitude])
 }
 
 model Rider {
@@ -180,10 +196,10 @@ model Rider {
 // ---------- Phase 1: Catalog ----------
 
 model Category {
-  id        String @id @default(cuid())
-  name      String @unique
+  id        String  @id @default(cuid())
+  name      String  @unique
   imageUrl  String?
-  sortOrder Int    @default(0)
+  sortOrder Int     @default(0)
 
   products Product[]
 }
@@ -210,41 +226,58 @@ model Product {
   @@index([vendorId])
   @@index([categoryId])
   @@index([isActive])
+  // A store's active catalog (storefront, search scoping).
+  @@index([vendorId, isActive])
+  // ILIKE '%q%' product search. Needs the pg_trgm extension, which the
+  // migration creates by hand (CREATE EXTENSION IF NOT EXISTS pg_trgm).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
 }
 
 // ---------- Phase 2/3: Orders, payments, payouts, coupons, ratings ----------
 // Modeled now for correct relations; business logic and endpoints land later.
 
 model Order {
-  id           String      @id @default(cuid())
-  customerId   String
-  vendorId     String
-  riderId      String?
-  addressId    String
-  status       OrderStatus @default(PLACED)
-  subtotal     Decimal     @db.Decimal(10, 2)
-  deliveryFee  Decimal     @db.Decimal(10, 2) @default(0)
-  discount     Decimal     @db.Decimal(10, 2) @default(0)
-  total        Decimal     @db.Decimal(10, 2)
-  couponCode   String?
-  placedAt     DateTime    @default(now())
-  deliveredAt  DateTime?
-  cancelledAt  DateTime?
-  cancelReason String?
+  id            String        @id @default(cuid())
+  customerId    String
+  vendorId      String
+  riderId       String?
+  addressId     String
+  status        OrderStatus   @default(PLACED)
+  paymentMethod PaymentMethod @default(COD)
+  subtotal      Decimal       @db.Decimal(10, 2)
+  deliveryFee   Decimal       @default(0) @db.Decimal(10, 2)
+  discount      Decimal       @default(0) @db.Decimal(10, 2)
+  total         Decimal       @db.Decimal(10, 2)
+  couponCode    String?
+  placedAt      DateTime      @default(now())
+  deliveredAt   DateTime?
+  cancelledAt   DateTime?
+  cancelReason  String?
 
-  customer User    @relation("CustomerOrders", fields: [customerId], references: [id])
-  vendor   Vendor  @relation(fields: [vendorId], references: [id])
-  rider    Rider?  @relation(fields: [riderId], references: [id])
-  address  Address @relation(fields: [addressId], references: [id])
-  items    OrderItem[]
-  payment  Payment?
-  ratings  Rating[]
+  customer         User              @relation("CustomerOrders", fields: [customerId], references: [id])
+  vendor           Vendor            @relation(fields: [vendorId], references: [id])
+  rider            Rider?            @relation(fields: [riderId], references: [id])
+  address          Address           @relation(fields: [addressId], references: [id])
+  items            OrderItem[]
+  payment          Payment?
+  ratings          Rating[]
+  couponRedemption CouponRedemption?
 
   @@index([customerId])
   @@index([vendorId])
   @@index([riderId])
   @@index([status])
   @@index([placedAt])
+  // GET /vendors/me/orders: one vendor's orders, newest first.
+  @@index([vendorId, placedAt])
+  // GET /riders/me/orders and the one-active-order cap on claim.
+  @@index([riderId, status])
+  // Rider available-orders: READY_FOR_PICKUP with no rider.
+  @@index([status, riderId])
+  // Vendor queue filtered by status, newest first.
+  @@index([vendorId, status, placedAt])
+  // Customer order history, newest first.
+  @@index([customerId, placedAt])
 }
 
 model OrderItem {
@@ -259,6 +292,8 @@ model OrderItem {
   product Product @relation(fields: [productId], references: [id])
 
   @@index([orderId])
+  // FK lookups from Product (e.g. "has this product ever been ordered").
+  @@index([productId])
 }
 
 model Payment {
@@ -292,16 +327,40 @@ model Payout {
 }
 
 model Coupon {
-  id            String   @id @default(cuid())
-  code          String   @unique
-  discountType  String // "FLAT" | "PERCENT"
-  discountValue Decimal  @db.Decimal(10, 2)
-  minOrderValue Decimal? @db.Decimal(10, 2)
+  id            String       @id @default(cuid())
+  code          String       @unique
+  discountType  DiscountType
+  discountValue Decimal      @db.Decimal(10, 2)
+  minOrderValue Decimal?     @db.Decimal(10, 2)
   maxUses       Int?
-  usedCount     Int      @default(0)
+  usedCount     Int          @default(0)
+  // Redemptions allowed per customer. 1 = once each (the default); null = no
+  // per-customer cap. Values above 1 are not supported while CouponRedemption
+  // is unique on (couponId, userId) — the admin endpoint rejects them.
+  perUserLimit  Int?         @default(1)
   validFrom     DateTime
   validUntil    DateTime
-  isActive      Boolean  @default(true)
+  isActive      Boolean      @default(true)
+
+  redemptions CouponRedemption[]
+}
+
+// One row per order that used a per-user-limited coupon. The unique constraint
+// is what enforces "once per customer" under concurrency; cancelling the order
+// deletes the row so the customer can use the coupon again.
+model CouponRedemption {
+  id        String   @id @default(cuid())
+  couponId  String
+  userId    String
+  orderId   String   @unique
+  createdAt DateTime @default(now())
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order  Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([couponId, userId])
+  @@index([userId])
 }
 
 model Rating {
@@ -329,5 +388,5 @@ model ServiceZone {
   id              String  @id @default(cuid())
   pincode         String  @unique
   isActive        Boolean @default(true)
-  baseDeliveryFee Decimal @db.Decimal(10, 2) @default(0)
+  baseDeliveryFee Decimal @default(0) @db.Decimal(10, 2)
 }

@@ -6,20 +6,16 @@ import type { AuthStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<AuthStackParamList>();
 
-/** Phone + OTP sign-in flow. Shown while there is no stored token. */
+/**
+ * Phone + OTP sign-in flow. Shown while there is no stored token. Headers are
+ * off; each screen renders its own ScreenHeader, so the navigator's title bar
+ * would sit on top of it as a second header.
+ */
 export default function AuthStack() {
   return (
-    <Stack.Navigator initialRouteName="PhoneEntry">
-      <Stack.Screen
-        name="PhoneEntry"
-        component={PhoneEntryScreen}
-        options={{ title: 'Sign in' }}
-      />
-      <Stack.Screen
-        name="OtpVerify"
-        component={OtpVerifyScreen}
-        options={{ title: 'Verify OTP' }}
-      />
+    <Stack.Navigator initialRouteName="PhoneEntry" screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="PhoneEntry" component={PhoneEntryScreen} />
+      <Stack.Screen name="OtpVerify" component={OtpVerifyScreen} />
     </Stack.Navigator>
   );
 }

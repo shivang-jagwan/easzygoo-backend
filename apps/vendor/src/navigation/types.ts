@@ -6,9 +6,11 @@
  */
 
 /**
- * Which of the four top-level flows the vendor sees. Currently hardcoded in
- * App.tsx; will be derived from stored auth + the Vendor row's status
- * (PENDING / APPROVED) once the API is wired up.
+ * Which of the four top-level flows the vendor sees. Derived by
+ * resolveVendorAppState() from the signed-in user plus the Vendor row's status
+ * — see src/lib/vendorAppState.ts. "Still deciding" and "the check failed" are
+ * deliberately NOT members here: they are handled by RootNavigator before it
+ * picks a branch, so every value in this union is a real flow.
  */
 export type VendorAppState = 'loggedOut' | 'onboarding' | 'pendingApproval' | 'active';
 
@@ -21,7 +23,9 @@ export type RootStackParamList = {
 
 export type AuthStackParamList = {
   PhoneEntry: undefined;
-  OtpVerify: undefined;
+  // Only serialisable values here. The live Firebase ConfirmationResult is
+  // held in AuthContext instead.
+  OtpVerify: { phoneNumber: string };
 };
 
 export type OnboardingStackParamList = {

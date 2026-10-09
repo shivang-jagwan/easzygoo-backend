@@ -1,6 +1,9 @@
-import '../lib/env'; // must be first — loads the root .env before anything reads process.env
+import '../lib/env'; // must be first — loads and validates the root .env
+import { WORKER_REQUIRED_ENV, requireEnv } from '../lib/env';
 import * as Sentry from '@sentry/node';
 import { initSentry } from '../lib/sentry';
+
+requireEnv('worker', WORKER_REQUIRED_ENV);
 
 // Separate process from the API server, so it needs its own Sentry init.
 initSentry();
@@ -9,7 +12,14 @@ import { Worker, type Job } from 'bullmq';
 import { getMessaging } from 'firebase-admin/messaging';
 import '../lib/firebase'; // initialises the Admin SDK
 import { prisma } from '../lib/prisma';
-import { NOTIFICATIONS_QUEUE, createQueueConnection, type NotificationJob } from '../lib/queue';
+import {
+  NOTIFICATIONS_QUEUE,
+  closeQueues,
+  createQueueConnection,
+  getNotificationsDlq,
+  type NotificationJob,
+} from '../lib/queue';
+import { REDIS_PREFIX } from '../lib/redis';
 
 /*
  * Notification worker — runs as its own process (`pnpm worker`), separate from
@@ -68,26 +78,57 @@ async function handle(job: Job<NotificationJob>) {
   return { sent: response.successCount, failed: response.failureCount };
 }
 
+// Unlike the API, the worker has nothing to do without Redis — in any environment.
+const connection = createQueueConnection('worker');
+if (!connection) {
+  throw new Error('REDIS_URL is not set — the notification worker cannot run without Redis');
+}
+
 const worker = new Worker<NotificationJob>(NOTIFICATIONS_QUEUE, handle, {
-  connection: createQueueConnection('worker'),
+  connection,
+  prefix: REDIS_PREFIX.bull,
 });
+
+/**
+ * True when BullMQ will not retry this job again: every attempt is used up, or
+ * the processor threw UnrecoverableError (which skips the remaining attempts).
+ */
+function isFinalFailure(job: Job<NotificationJob>, err: Error): boolean {
+  return err.name === 'UnrecoverableError' || job.attemptsMade >= (job.opts.attempts ?? 1);
+}
 
 worker.on('failed', (job, err) => {
   console.error(`[worker] job ${job?.id} failed (attempt ${job?.attemptsMade}):`, err.message);
+  if (!job || !isFinalFailure(job, err)) return; // BullMQ will retry it
+
+  // Dead letter: copy the payload and the reason to the DLQ (GET /v1/admin/dlq)
+  // and report once to Sentry — intermediate attempts are only logged above.
   Sentry.captureException(err, {
-    extra: {
-      jobId: job?.id,
-      userId: job?.data?.userId,
-      attemptsMade: job?.attemptsMade,
-      queue: NOTIFICATIONS_QUEUE,
-    },
+    tags: { queue: NOTIFICATIONS_QUEUE, deadLettered: 'true' },
+    extra: { jobId: job.id, userId: job.data?.userId, attemptsMade: job.attemptsMade },
   });
+  getNotificationsDlq()
+    ?.add('dead', {
+      originalJobId: job.id,
+      queue: NOTIFICATIONS_QUEUE,
+      payload: job.data,
+      failedReason: err.message,
+      stacktrace: job.stacktrace ?? [],
+      attemptsMade: job.attemptsMade,
+      failedAt: new Date().toISOString(),
+    })
+    .catch((dlqErr: Error) => {
+      // Losing the DLQ copy must still be visible somewhere.
+      console.error(`[worker] could not dead-letter job ${job.id}:`, dlqErr.message);
+      Sentry.captureException(dlqErr, { extra: { jobId: job.id } });
+    });
 });
 worker.on('ready', () => console.log('[worker] notification worker ready'));
 
 const shutdown = async () => {
   console.log('[worker] shutting down, draining in-flight jobs...');
   await worker.close();
+  await closeQueues(); // the DLQ producer, if it was opened
   await prisma.$disconnect();
   process.exit(0);
 };

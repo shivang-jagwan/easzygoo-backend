@@ -14,7 +14,9 @@ const Tab = createBottomTabNavigator<MainTabParamList>();
  */
 export default function MainTabs() {
   return (
-    <Tab.Navigator initialRouteName="Orders">
+    // headerShown: false — each screen draws its own ScreenHeader, so the
+    // navigator's title bar would be a second header above it.
+    <Tab.Navigator initialRouteName="Orders" screenOptions={{ headerShown: false }}>
       <Tab.Screen name="Orders" component={OrdersScreen} />
       <Tab.Screen name="Catalog" component={CatalogScreen} />
       <Tab.Screen name="Earnings" component={EarningsScreen} />

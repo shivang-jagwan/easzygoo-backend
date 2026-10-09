@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { Prisma, Role } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { AuthError, verifyBearerToken } from '../lib/auth-middleware';
+import { RATE_LIMITS, perIp } from '../lib/rate-limits';
 
 // Roles a client may self-assign at signup. ADMIN is never grantable here.
 const SIGNUP_ROLES: Role[] = [Role.CUSTOMER, Role.VENDOR, Role.RIDER];
@@ -23,7 +24,9 @@ export default async function authRoutes(app: FastifyInstance) {
    * No custom JWT is issued — clients keep sending the Firebase ID token as the
    * bearer token on every other route.
    */
-  app.post('/auth/verify', async (request, reply) => {
+  // Rate limited per IP: this is the one unauthenticated write, and the
+  // natural target for token-stuffing and signup spam.
+  app.post('/auth/verify', { config: perIp(RATE_LIMITS.authVerify) }, async (request, reply) => {
     let decoded;
     try {
       decoded = await verifyBearerToken(request);

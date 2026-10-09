@@ -13,17 +13,10 @@ const Stack = createNativeStackNavigator<OnboardingStackParamList>();
  */
 export default function OnboardingStack() {
   return (
-    <Stack.Navigator initialRouteName="StoreDetails">
-      <Stack.Screen
-        name="StoreDetails"
-        component={StoreDetailsScreen}
-        options={{ title: 'Store details' }}
-      />
-      <Stack.Screen
-        name="BankDetails"
-        component={BankDetailsScreen}
-        options={{ title: 'Bank details' }}
-      />
+    // headerShown: false — see AuthStack; each screen carries its own header.
+    <Stack.Navigator initialRouteName="StoreDetails" screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="StoreDetails" component={StoreDetailsScreen} />
+      <Stack.Screen name="BankDetails" component={BankDetailsScreen} />
     </Stack.Navigator>
   );
 }

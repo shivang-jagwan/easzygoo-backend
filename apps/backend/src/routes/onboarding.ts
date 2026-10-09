@@ -2,10 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { requireAuth, requireRole } from '../lib/auth-middleware';
+import { maskBankDetails } from '../lib/pii';
 
 /**
- * One-time profile creation for vendors and riders. Both rows default to status
- * PENDING (schema default) — admin approval is a separate flow, not built yet.
+ * The vendor and rider profile: created once here, and read back here.
+ * Both rows default to status PENDING (schema default) — admin approval is a
+ * separate flow, not built yet.
  */
 export default async function onboardingRoutes(app: FastifyInstance) {
   // POST /v1/vendors/onboard — vendor only, creates the caller's Vendor profile once
@@ -66,7 +68,7 @@ export default async function onboardingRoutes(app: FastifyInstance) {
             bankIfsc,
           },
         });
-        return reply.code(201).send(vendor);
+        return reply.code(201).send(maskBankDetails(vendor));
       } catch (err) {
         // Concurrent onboard for the same user won the race.
         if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
@@ -74,6 +76,33 @@ export default async function onboardingRoutes(app: FastifyInstance) {
         }
         throw err;
       }
+    },
+  );
+
+  /**
+   * GET /v1/vendors/me — vendor only, the caller's own profile.
+   *
+   * A vendor who has signed up but not yet filled in their store is a normal,
+   * expected state, not a failure — so it answers 200 with onboarded:false
+   * rather than 404. The app branches on that flag to decide between the
+   * onboarding form and the dashboard; a 404 would have it treating a brand-new
+   * vendor as a broken request.
+   */
+  app.get(
+    '/vendors/me',
+    { preHandler: [requireAuth, requireRole('VENDOR')] },
+    async (request) => {
+      const vendor = await prisma.vendor.findUnique({
+        where: { userId: request.authUser!.userId },
+      });
+
+      if (!vendor) {
+        return { onboarded: false };
+      }
+
+      // The vendor's own row, but bank details masked to the last 4 digits
+      // like everywhere else — see lib/pii.ts.
+      return { onboarded: true, vendor: maskBankDetails(vendor) };
     },
   );
 
@@ -115,7 +144,7 @@ export default async function onboardingRoutes(app: FastifyInstance) {
         const rider = await prisma.rider.create({
           data: { userId, vehicleType, vehicleNumber, idProofUrl, bankAccountNumber, bankIfsc },
         });
-        return reply.code(201).send(rider);
+        return reply.code(201).send(maskBankDetails(rider));
       } catch (err) {
         if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
           return reply.code(409).send({ error: 'Rider profile already exists' });
